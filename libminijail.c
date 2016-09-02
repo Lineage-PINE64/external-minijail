@@ -1306,7 +1306,7 @@ void set_seccomp_filter(const struct minijail *j)
 				warn("seccomp not supported");
 				return;
 			}
-			pdie("prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)");
+			warn("prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)");
 		}
 	}
 }
