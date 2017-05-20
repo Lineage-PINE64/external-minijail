@@ -11,8 +11,9 @@
 
 #include "bpf.h"
 
-#define NO_LOGGING  0
-#define USE_LOGGING 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 struct filter_block {
 	struct sock_filter *instrs;
@@ -26,12 +27,20 @@ struct filter_block {
 struct bpf_labels;
 
 struct filter_block *compile_section(int nr, const char *policy_line,
-		unsigned int label_id, struct bpf_labels *labels);
-int compile_filter(FILE *policy_file, struct sock_fprog *prog,
-		int log_failures);
+				     unsigned int label_id,
+				     struct bpf_labels *labels,
+				     int do_ret_trap);
+int compile_filter(FILE *policy_file, struct sock_fprog *prog, int do_ret_trap,
+		   int add_logging_syscalls);
 
 int flatten_block_list(struct filter_block *head, struct sock_filter *filter,
-		size_t index, size_t cap);
+		       size_t index, size_t cap);
 void free_block_list(struct filter_block *head);
+
+int seccomp_can_softfail();
+
+#ifdef __cplusplus
+}; /* extern "C" */
+#endif
 
 #endif /* SYSCALL_FILTER_H */

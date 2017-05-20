@@ -11,11 +11,21 @@
 
 #include "util.h"
 
-#define MAX_LINE_LENGTH		1024
+/* clang-format off */
+#define MAX_LINE_LENGTH 	1024
 #define MAX_POLICY_LINE_LENGTH	1024
 
 #define ONE_INSTR	1
 #define TWO_INSTRS	2
+/* clang-format on */
+
+int seccomp_can_softfail()
+{
+#if defined(USE_SECCOMP_SOFTFAIL)
+	return 1;
+#endif
+	return 0;
+}
 
 int str_to_op(const char *op_str)
 {
@@ -25,6 +35,8 @@ int str_to_op(const char *op_str)
 		return NE;
 	} else if (!strcmp(op_str, "&")) {
 		return SET;
+	} else if (!strcmp(op_str, "in")) {
+		return IN;
 	} else {
 		return 0;
 	}
@@ -51,8 +63,8 @@ struct filter_block *new_filter_block()
 	return block;
 }
 
-void append_filter_block(struct filter_block *head,
-		struct sock_filter *instrs, size_t len)
+void append_filter_block(struct filter_block *head, struct sock_filter *instrs,
+			 size_t len)
 {
 	struct filter_block *new_last;
 
@@ -79,7 +91,7 @@ void append_filter_block(struct filter_block *head,
 }
 
 void extend_filter_block_list(struct filter_block *list,
-		struct filter_block *another)
+			      struct filter_block *another)
 {
 	if (list->last != NULL) {
 		list->last->next = another;
@@ -122,7 +134,7 @@ void append_allow_syscall(struct filter_block *head, int nr)
 	append_filter_block(head, filter, len);
 }
 
-void allow_log_syscalls(struct filter_block *head)
+void allow_logging_syscalls(struct filter_block *head)
 {
 	unsigned int i;
 	for (i = 0; i < log_syscalls_len; i++) {
@@ -154,44 +166,69 @@ unsigned int success_lbl(struct bpf_labels *labels, int nr)
 }
 
 int compile_atom(struct filter_block *head, char *atom,
-		struct bpf_labels *labels, int nr, int group_idx)
+		 struct bpf_labels *labels, int nr, int grp_idx)
 {
 	/* Splits the atom. */
 	char *atom_ptr;
 	char *argidx_str = strtok_r(atom, " ", &atom_ptr);
+	if (argidx_str == NULL) {
+		warn("empty atom");
+		return -1;
+	}
+
 	char *operator_str = strtok_r(NULL, " ", &atom_ptr);
+	if (operator_str == NULL) {
+		warn("invalid atom '%s'", argidx_str);
+		return -1;
+	}
+
 	char *constant_str = strtok_r(NULL, " ", &atom_ptr);
-
-	if (argidx_str == NULL || operator_str == NULL || constant_str == NULL)
+	if (constant_str == NULL) {
+		warn("invalid atom '%s %s'", argidx_str, operator_str);
 		return -1;
+	}
 
-	int op = str_to_op(operator_str);
-	if (op < MIN_OPERATOR)
+	/* Checks that there are no extra tokens. */
+	const char *extra = strtok_r(NULL, " ", &atom_ptr);
+	if (extra != NULL) {
+		warn("extra token '%s'", extra);
 		return -1;
+	}
 
 	if (strncmp(argidx_str, "arg", 3)) {
+		warn("invalid argument token '%s'", argidx_str);
 		return -1;
 	}
 
 	char *argidx_ptr;
 	long int argidx = strtol(argidx_str + 3, &argidx_ptr, 10);
 	/*
-	 * Checks to see if an actual argument index
-	 * was parsed.
+	 * Checks that an actual argument index was parsed,
+	 * and that there was nothing left after the index.
 	 */
-	if (argidx_ptr == argidx_str + 3)
+	if (argidx_ptr == argidx_str + 3 || *argidx_ptr != '\0') {
+		warn("invalid argument index '%s'", argidx_str + 3);
 		return -1;
+	}
+
+	int op = str_to_op(operator_str);
+	if (op < MIN_OPERATOR) {
+		warn("invalid operator '%s'", operator_str);
+		return -1;
+	}
 
 	char *constant_str_ptr;
 	long int c = parse_constant(constant_str, &constant_str_ptr);
-	if (constant_str_ptr == constant_str)
+	if (constant_str_ptr == constant_str) {
+		warn("invalid constant '%s'", constant_str);
 		return -1;
+	}
 
 	/*
 	 * Looks up the label for the end of the AND statement
 	 * this atom belongs to.
 	 */
-	unsigned int id = group_end_lbl(labels, nr, group_idx);
+	unsigned int id = group_end_lbl(labels, nr, grp_idx);
 
 	/*
 	 * Builds a BPF comparison between a syscall argument
@@ -211,7 +248,7 @@ int compile_atom(struct filter_block *head, char *atom,
 	return 0;
 }
 
-int compile_errno(struct filter_block *head, char *ret_errno)
+int compile_errno(struct filter_block *head, char *ret_errno, int use_ret_trap)
 {
 	char *errno_ptr;
 
@@ -226,18 +263,25 @@ int compile_errno(struct filter_block *head, char *ret_errno)
 		char *errno_val_ptr;
 		int errno_val = parse_constant(errno_val_str, &errno_val_ptr);
 		/* Checks to see if we parsed an actual errno. */
-		if (errno_val_ptr == errno_val_str || errno_val == -1)
+		if (errno_val_ptr == errno_val_str || errno_val == -1) {
+			warn("invalid errno value '%s'", errno_val_ptr);
 			return -1;
+		}
 
 		append_ret_errno(head, errno_val);
 	} else {
-		append_ret_kill(head);
+		if (!use_ret_trap)
+			append_ret_kill(head);
+		else
+			append_ret_trap(head);
 	}
 	return 0;
 }
 
 struct filter_block *compile_section(int nr, const char *policy_line,
-		unsigned int entry_lbl_id, struct bpf_labels *labels)
+				     unsigned int entry_lbl_id,
+				     struct bpf_labels *labels,
+				     int use_ret_trap)
 {
 	/*
 	 * |policy_line| should be an expression of the form:
@@ -250,7 +294,7 @@ struct filter_block *compile_section(int nr, const char *policy_line,
 	 * Atoms are of the form "arg{DNUM} {OP} {NUM}"
 	 * where:
 	 *   - DNUM is a decimal number.
-	 *   - OP is an operator: ==, !=, or & (flags set).
+	 *   - OP is an operator: ==, !=, & (flags set), or 'in' (inclusion).
 	 *   - NUM is an octal, decimal, or hexadecimal number.
 	 *
 	 * When the syscall arguments make the expression true,
@@ -272,7 +316,13 @@ struct filter_block *compile_section(int nr, const char *policy_line,
 	 */
 
 	size_t len = 0;
-	int group_idx = 0;
+	int grp_idx = 0;
+
+	/* Checks for empty policy lines. */
+	if (strlen(policy_line) == 0) {
+		warn("empty policy line");
+		return NULL;
+	}
 
 	/* Checks for overly long policy lines. */
 	if (strlen(policy_line) >= MAX_POLICY_LINE_LENGTH)
@@ -299,8 +349,11 @@ struct filter_block *compile_section(int nr, const char *policy_line,
 
 	/* Checks whether we're unconditionally blocking this syscall. */
 	if (strncmp(line, "return", strlen("return")) == 0) {
-		if (compile_errno(head, line) < 0)
+		if (compile_errno(head, line, use_ret_trap) < 0) {
+			free_block_list(head);
+			free(line);
 			return NULL;
+		}
 		free(line);
 		return head;
 	}
@@ -321,8 +374,11 @@ struct filter_block *compile_section(int nr, const char *policy_line,
 		char *comp;
 		while ((comp = tokenize(&group_str, "&&")) != NULL) {
 			/* Compiles each atom into a BPF block. */
-			if (compile_atom(head, comp, labels, nr, group_idx) < 0)
+			if (compile_atom(head, comp, labels, nr, grp_idx) < 0) {
+				free_block_list(head);
+				free(line);
 				return NULL;
+			}
 		}
 		/*
 		 * If the AND statement succeeds, we're done,
@@ -335,7 +391,7 @@ struct filter_block *compile_section(int nr, const char *policy_line,
 		 * The end of each AND statement falls after the
 		 * jump to SUCCESS.
 		 */
-		id = group_end_lbl(labels, nr, group_idx++);
+		id = group_end_lbl(labels, nr, grp_idx++);
 		len += set_bpf_lbl(group_end_block + len, id);
 		append_filter_block(head, group_end_block, len);
 	}
@@ -347,10 +403,16 @@ struct filter_block *compile_section(int nr, const char *policy_line,
 	 * otherwise just kill the task.
 	 */
 	if (ret_errno) {
-		if (compile_errno(head, ret_errno) < 0)
+		if (compile_errno(head, ret_errno, use_ret_trap) < 0) {
+			free_block_list(head);
+			free(line);
 			return NULL;
+		}
 	} else {
-		append_ret_kill(head);
+		if (!use_ret_trap)
+			append_ret_kill(head);
+		else
+			append_ret_trap(head);
 	}
 
 	/*
@@ -367,8 +429,8 @@ struct filter_block *compile_section(int nr, const char *policy_line,
 	return head;
 }
 
-int compile_filter(FILE *policy_file, struct sock_fprog *prog,
-		int log_failures)
+int compile_filter(FILE *policy_file, struct sock_fprog *prog, int use_ret_trap,
+		   int allow_logging)
 {
 	char line[MAX_LINE_LENGTH];
 	int line_count = 0;
@@ -392,9 +454,9 @@ int compile_filter(FILE *policy_file, struct sock_fprog *prog,
 	len = bpf_load_syscall_nr(load_nr);
 	append_filter_block(head, load_nr, len);
 
-	/* If we're logging failures, allow the necessary syscalls first. */
-	if (log_failures)
-		allow_log_syscalls(head);
+	/* If logging failures, allow the necessary syscalls first. */
+	if (allow_logging)
+		allow_logging_syscalls(head);
 
 	/*
 	 * Loop through all the lines in the policy file.
@@ -416,14 +478,17 @@ int compile_filter(FILE *policy_file, struct sock_fprog *prog,
 		if (*syscall_name == '#' || *syscall_name == '\0')
 			continue;
 
-		if (!policy_line)
+		if (strlen(policy_line) == 0) {
+			warn("compile_filter: empty policy line");
+			free_block_list(head);
 			return -1;
+		}
 
 		nr = lookup_syscall(syscall_name);
 		if (nr < 0) {
 			warn("compile_filter: nonexistent syscall '%s'",
 			     syscall_name);
-			if (log_failures) {
+			if (allow_logging) {
 				/*
 				 * If we're logging failures, assume we're in a
 				 * debugging case and continue.
@@ -437,6 +502,7 @@ int compile_filter(FILE *policy_file, struct sock_fprog *prog,
 				 */
 				continue;
 			}
+			free_block_list(head);
 			return -1;
 		}
 
@@ -456,16 +522,22 @@ int compile_filter(FILE *policy_file, struct sock_fprog *prog,
 			 */
 			unsigned int id = bpf_label_id(&labels, syscall_name);
 			struct sock_filter *nr_comp =
-					new_instr_buf(ALLOW_SYSCALL_LEN);
+			    new_instr_buf(ALLOW_SYSCALL_LEN);
 			bpf_allow_syscall_args(nr_comp, nr, id);
 			append_filter_block(head, nr_comp, ALLOW_SYSCALL_LEN);
 
 			/* Build the arg filter block. */
-			struct filter_block *block =
-				compile_section(nr, policy_line, id, &labels);
+			struct filter_block *block = compile_section(
+			    nr, policy_line, id, &labels, use_ret_trap);
 
-			if (!block)
+			if (!block) {
+				if (arg_blocks) {
+					free_block_list(arg_blocks);
+				}
+				free_label_strings(&labels);
+				free_block_list(head);
 				return -1;
+			}
 
 			if (arg_blocks) {
 				extend_filter_block_list(arg_blocks, block);
@@ -476,34 +548,35 @@ int compile_filter(FILE *policy_file, struct sock_fprog *prog,
 	}
 
 	/*
-	 * If none of the syscalls match, either fall back to KILL,
+	 * If none of the syscalls match, either fall through to KILL,
 	 * or return TRAP.
 	 */
-	if (!log_failures)
+	if (!use_ret_trap)
 		append_ret_kill(head);
 	else
 		append_ret_trap(head);
 
 	/* Allocate the final buffer, now that we know its size. */
-	size_t final_filter_len = head->total_len +
-		(arg_blocks? arg_blocks->total_len : 0);
+	size_t final_filter_len =
+	    head->total_len + (arg_blocks ? arg_blocks->total_len : 0);
 	if (final_filter_len > BPF_MAXINSNS)
 		return -1;
 
 	struct sock_filter *final_filter =
-			calloc(final_filter_len, sizeof(struct sock_filter));
+	    calloc(final_filter_len, sizeof(struct sock_filter));
 
 	if (flatten_block_list(head, final_filter, 0, final_filter_len) < 0)
 		return -1;
 
-	if (flatten_block_list(arg_blocks, final_filter,
-			head->total_len, final_filter_len) < 0)
+	if (flatten_block_list(arg_blocks, final_filter, head->total_len,
+			       final_filter_len) < 0)
 		return -1;
 
 	free_block_list(head);
 	free_block_list(arg_blocks);
 
-	bpf_resolve_jumps(&labels, final_filter, final_filter_len);
+	if (bpf_resolve_jumps(&labels, final_filter, final_filter_len) < 0)
+		return -1;
 
 	free_label_strings(&labels);
 
@@ -513,7 +586,7 @@ int compile_filter(FILE *policy_file, struct sock_fprog *prog,
 }
 
 int flatten_block_list(struct filter_block *head, struct sock_filter *filter,
-		size_t index, size_t cap)
+		       size_t index, size_t cap)
 {
 	size_t _index = index;
 
